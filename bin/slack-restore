@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE_FILE="$ROOT_DIR/Sources/slack-restore-agent/main.swift"
+BUILD_DIR="${SLACK_RESTORE_BUILD_DIR:-$ROOT_DIR/.build}"
+APP_BUNDLE="$BUILD_DIR/Slack Restore Agent.app"
+APP_CONTENTS="$APP_BUNDLE/Contents"
+APP_MACOS="$APP_CONTENTS/MacOS"
+INFO_PLIST="$APP_CONTENTS/Info.plist"
+HELPER="$APP_MACOS/slack-restore-agent"
+LABEL="${SLACK_RESTORE_LABEL:-com.vecchio.slack-restore}"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$HOME/Library/Logs"
+OUT_LOG="$LOG_DIR/slack-restore.log"
+ERR_LOG="$LOG_DIR/slack-restore.err.log"
+
+usage() {
+  cat <<EOF
+Usage: bin/slack-restore <command> [options]
+
+Commands:
+  build                         Compile the Swift helper.
+  run [agent options]           Build if needed, launch the app, and tail its log.
+  once [agent options]          Build if needed, run one poll with verbose logging, then exit.
+  prompt-permission             Ask macOS for Accessibility permission for Slack Restore Agent.
+  open-permissions              Open Accessibility settings and reveal the app bundle.
+  install [--interval seconds]  Install and start the LaunchAgent. Default interval: 2.
+  uninstall                     Stop the LaunchAgent and remove its plist.
+  restart [--interval seconds]  Rebuild, refresh, and restart the LaunchAgent.
+  status                        Print launchd status for the LaunchAgent.
+  logs                          Tail the LaunchAgent stdout/stderr logs.
+  help                          Show this help.
+
+Common agent options:
+  --interval SECONDS
+  --expected-displays NUMBER
+  --verbose
+  --dry-run
+
+Environment:
+  SLACK_RESTORE_INTERVAL_SECONDS    Poll interval used by install. Default: 2.
+  SLACK_RESTORE_EXPECTED_DISPLAYS   Required active display count. Default: 3.
+  SLACK_RESTORE_VERBOSE             Set to 1 for verbose LaunchAgent logs.
+EOF
+}
+
+build_helper() {
+  mkdir -p "$APP_MACOS"
+  local needs_sign=0
+  local info_tmp
+  info_tmp="$(mktemp "${TMPDIR:-/tmp}/slack-restore-info.XXXXXX")"
+  cat > "$info_tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>slack-restore-agent</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.vecchio.slack-restore-agent</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Slack Restore Agent</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSBackgroundOnly</key>
+  <true/>
+</dict>
+</plist>
+EOF
+  if [[ ! -f "$INFO_PLIST" ]] || ! cmp -s "$info_tmp" "$INFO_PLIST"; then
+    mv "$info_tmp" "$INFO_PLIST"
+    needs_sign=1
+  else
+    rm -f "$info_tmp"
+  fi
+  if [[ ! -x "$HELPER" || "$SOURCE_FILE" -nt "$HELPER" ]]; then
+    swiftc -O -o "$HELPER" "$SOURCE_FILE"
+    needs_sign=1
+  fi
+  if command -v codesign >/dev/null 2>&1; then
+    if [[ "$needs_sign" == "1" ]] || ! codesign --verify "$APP_BUNDLE" >/dev/null 2>&1; then
+      codesign --force --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+open_permission_settings() {
+  build_helper
+  open -R "$APP_BUNDLE"
+  open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" >/dev/null 2>&1 || true
+  cat <<EOF
+Accessibility permission should be granted to:
+
+  $APP_BUNDLE
+
+If macOS shows iTerm in the prompt, do not grant it just for this tool. Use the
+Accessibility settings window instead: click +, press Cmd+Shift+G, paste the
+path above, and add "Slack Restore Agent.app".
+EOF
+}
+
+write_plist() {
+  local interval="${SLACK_RESTORE_INTERVAL_SECONDS:-2}"
+  local expected_displays="${SLACK_RESTORE_EXPECTED_DISPLAYS:-3}"
+  local verbose="${SLACK_RESTORE_VERBOSE:-0}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval)
+        shift
+        [[ $# -gt 0 ]] || { echo "--interval requires a value" >&2; exit 1; }
+        interval="$1"
+        ;;
+      --expected-displays)
+        shift
+        [[ $# -gt 0 ]] || { echo "--expected-displays requires a value" >&2; exit 1; }
+        expected_displays="$1"
+        ;;
+      --verbose)
+        verbose="1"
+        ;;
+      *)
+        echo "unknown install option: $1" >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+  local verbose_plist=""
+  if [[ "$verbose" == "1" || "$verbose" == "true" || "$verbose" == "yes" || "$verbose" == "on" ]]; then
+    verbose_plist="    <string>--verbose</string>"
+  fi
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-W</string>
+    <string>-n</string>
+    <string>$APP_BUNDLE</string>
+    <string>--args</string>
+    <string>--interval</string>
+    <string>$interval</string>
+    <string>--expected-displays</string>
+    <string>$expected_displays</string>
+    <string>--log-file</string>
+    <string>$OUT_LOG</string>
+$verbose_plist
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SLACK_RESTORE_INTERVAL_SECONDS</key>
+    <string>$interval</string>
+    <key>SLACK_RESTORE_EXPECTED_DISPLAYS</key>
+    <string>$expected_displays</string>
+    <key>SLACK_RESTORE_VERBOSE</key>
+    <string>$verbose</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$OUT_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$ERR_LOG</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null
+}
+
+run_app_once() {
+  build_helper
+  local status_file
+  status_file="$(mktemp "${TMPDIR:-/tmp}/slack-restore-once.XXXXXX")"
+  : > "$status_file"
+
+  set +e
+  open -W -n "$APP_BUNDLE" --args --once --verbose --log-file "$status_file" "$@"
+  local open_status=$?
+  set -e
+
+  if [[ -s "$status_file" ]]; then
+    cat "$status_file"
+  else
+    echo "No status was written by Slack Restore Agent.app."
+  fi
+  rm -f "$status_file"
+  return "$open_status"
+}
+
+run_app_with_logs() {
+  build_helper
+  mkdir -p "$LOG_DIR"
+  touch "$OUT_LOG"
+  open -n "$APP_BUNDLE" --args --log-file "$OUT_LOG" "$@"
+  tail -f "$OUT_LOG"
+}
+
+bootstrap_agent() {
+  launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$UID" "$PLIST"
+  launchctl enable "gui/$UID/$LABEL"
+  launchctl kickstart -k "gui/$UID/$LABEL"
+}
+
+uninstall_agent() {
+  launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
+  rm -f "$PLIST"
+}
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+  build)
+    build_helper
+    echo "$APP_BUNDLE"
+    ;;
+  run)
+    run_app_with_logs "$@"
+    ;;
+  once)
+    run_app_once "$@"
+    ;;
+  prompt-permission)
+    build_helper
+    open_permission_settings
+    run_app_once --prompt-permission
+    ;;
+  open-permissions)
+    open_permission_settings
+    ;;
+  install)
+    build_helper
+    write_plist "$@"
+    bootstrap_agent
+    echo "Installed $LABEL"
+    echo "Logs: $OUT_LOG and $ERR_LOG"
+    ;;
+  uninstall)
+    uninstall_agent
+    echo "Uninstalled $LABEL"
+    ;;
+  restart)
+    build_helper
+    write_plist "$@"
+    bootstrap_agent
+    echo "Restarted $LABEL"
+    ;;
+  status)
+    launchctl print "gui/$UID/$LABEL"
+    ;;
+  logs)
+    mkdir -p "$LOG_DIR"
+    touch "$OUT_LOG" "$ERR_LOG"
+    tail -f "$OUT_LOG" "$ERR_LOG"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    echo "unknown command: $command" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
