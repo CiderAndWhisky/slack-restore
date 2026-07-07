@@ -440,7 +440,8 @@ final class WindowRestoreAgent {
             return .idle("\(rule.key)-no-visible-window", "No visible \(rule.displayName) main window on the current Space.")
         }
 
-        guard !targetDisplay.bounds.contains(center(of: visibleWindow.bounds)) else {
+        let currentBounds = windowBounds(for: visibleWindow, runningPIDs: runningPIDs)
+        guard !isClose(currentBounds, to: targetDisplay.bounds) else {
             return .idle("\(rule.key)-already-\(rule.target.rawValue)", "\(rule.displayName) is already on the \(rule.target.description) display.")
         }
 
@@ -454,6 +455,15 @@ final class WindowRestoreAgent {
                 "\(rule.key)-missing-ax-window",
                 "\(rule.displayName) is visible but its Accessibility window could not be matched."
             )
+        }
+    }
+
+    private func windowBounds(for visibleWindow: VisibleWindow, runningPIDs: Set<pid_t>) -> CGRect {
+        switch resolveAXWindow(for: visibleWindow, runningPIDs: runningPIDs) {
+        case .found(let window):
+            return window.frame ?? visibleWindow.bounds
+        case .skipped, .missing:
+            return visibleWindow.bounds
         }
     }
 
@@ -472,34 +482,86 @@ final class WindowRestoreAgent {
             )
         }
 
-        var position = targetBounds.origin
-        var size = targetBounds.size
-
-        guard let positionValue = AXValueCreate(.cgPoint, &position),
-              let sizeValue = AXValueCreate(.cgSize, &size) else {
-            return .important("ax-value-create-failed", "Could not create Accessibility geometry values.")
+        if rule.target == .leftmost {
+            let stagingBounds = stagingFrame(inside: targetBounds)
+            if let status = apply(frame: stagingBounds, to: window, rule: rule, stage: "staging", order: .sizeThenPosition) {
+                return status
+            }
         }
-
-        let positionResult = AXUIElementSetAttributeValue(window.element, kAXPositionAttribute as CFString, positionValue)
-        guard positionResult == .success else {
-            return .important(
-                "\(rule.key)-move-position-failed-\(positionResult.rawValue)",
-                "Could not move \(rule.displayName) window: AX position update failed with \(positionResult)."
-            )
+        if let status = apply(frame: targetBounds, to: window, rule: rule, stage: "target", order: .positionThenSize) {
+            return status
         }
-
-        let sizeResult = AXUIElementSetAttributeValue(window.element, kAXSizeAttribute as CFString, sizeValue)
-        guard sizeResult == .success else {
-            return .important(
-                "\(rule.key)-move-size-failed-\(sizeResult.rawValue)",
-                "Could not resize \(rule.displayName) window: AX size update failed with \(sizeResult)."
-            )
+        if let status = apply(position: targetBounds.origin, to: window, rule: rule, stage: "final-position") {
+            return status
         }
 
         return .important(
             "\(rule.key)-moved-\(visibleWindow.windowNumber)-\(Int(targetBounds.minX))-\(Int(targetBounds.minY))",
             "Moved \(rule.displayName) window \(visibleWindow.windowNumber) to the \(rule.target.description) display \(format(rect: targetBounds))."
         )
+    }
+
+    private func stagingFrame(inside targetBounds: CGRect) -> CGRect {
+        let width = min(targetBounds.width, max(config.minWindowWidth, targetBounds.width * 0.45))
+        let height = min(targetBounds.height, max(config.minWindowHeight, targetBounds.height * 0.45))
+        return CGRect(
+            x: targetBounds.minX + ((targetBounds.width - width) / 2),
+            y: targetBounds.minY + ((targetBounds.height - height) / 2),
+            width: width,
+            height: height
+        )
+    }
+
+    private enum FrameApplyOrder {
+        case positionThenSize
+        case sizeThenPosition
+    }
+
+    private func apply(frame: CGRect, to window: AXWindowMetadata, rule: AppRule, stage: String, order: FrameApplyOrder) -> TickStatus? {
+        switch order {
+        case .positionThenSize:
+            if let status = apply(position: frame.origin, to: window, rule: rule, stage: stage) {
+                return status
+            }
+            return apply(size: frame.size, to: window, rule: rule, stage: stage)
+        case .sizeThenPosition:
+            if let status = apply(size: frame.size, to: window, rule: rule, stage: stage) {
+                return status
+            }
+            return apply(position: frame.origin, to: window, rule: rule, stage: stage)
+        }
+    }
+
+    private func apply(position: CGPoint, to window: AXWindowMetadata, rule: AppRule, stage: String) -> TickStatus? {
+        var position = position
+        guard let positionValue = AXValueCreate(.cgPoint, &position) else {
+            return .important("ax-value-create-failed", "Could not create Accessibility geometry values.")
+        }
+
+        let result = AXUIElementSetAttributeValue(window.element, kAXPositionAttribute as CFString, positionValue)
+        guard result == .success else {
+            return .important(
+                "\(rule.key)-move-position-failed-\(stage)-\(result.rawValue)",
+                "Could not move \(rule.displayName) window during \(stage): AX position update failed with \(result)."
+            )
+        }
+        return nil
+    }
+
+    private func apply(size: CGSize, to window: AXWindowMetadata, rule: AppRule, stage: String) -> TickStatus? {
+        var size = size
+        guard let sizeValue = AXValueCreate(.cgSize, &size) else {
+            return .important("ax-value-create-failed", "Could not create Accessibility geometry values.")
+        }
+
+        let result = AXUIElementSetAttributeValue(window.element, kAXSizeAttribute as CFString, sizeValue)
+        guard result == .success else {
+            return .important(
+                "\(rule.key)-move-size-failed-\(stage)-\(result.rawValue)",
+                "Could not resize \(rule.displayName) window during \(stage): AX size update failed with \(result)."
+            )
+        }
+        return nil
     }
 
     private func activeDisplays() throws -> [Display] {
@@ -700,6 +762,13 @@ private func isAccessibilityTrusted(prompt: Bool) -> Bool {
 
 private func center(of rect: CGRect) -> CGPoint {
     CGPoint(x: rect.midX, y: rect.midY)
+}
+
+private func isClose(_ first: CGRect, to second: CGRect, tolerance: CGFloat = 8) -> Bool {
+    abs(first.minX - second.minX) <= tolerance
+        && abs(first.minY - second.minY) <= tolerance
+        && abs(first.width - second.width) <= tolerance
+        && abs(first.height - second.height) <= tolerance
 }
 
 private func format(rect: CGRect) -> String {
