@@ -152,11 +152,7 @@ write_plist() {
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/open</string>
-    <string>-W</string>
-    <string>-n</string>
-    <string>$APP_BUNDLE</string>
-    <string>--args</string>
+    <string>$HELPER</string>
     <string>--interval</string>
     <string>$interval</string>
     <string>--expected-displays</string>
@@ -216,8 +212,17 @@ run_app_with_logs() {
   tail -f "$OUT_LOG"
 }
 
+kill_stray_agents() {
+  # Older installs launched the agent via `open -n`, which launchd could not
+  # actually supervise (it only tracked the `open` process, not the app it
+  # spawned) - `launchctl bootout` left those orphaned forever. Clean up any
+  # leftovers before starting the correctly-supervised instance.
+  pkill -f "$APP_MACOS/slack-restore-agent" >/dev/null 2>&1 || true
+}
+
 bootstrap_agent() {
   launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
+  kill_stray_agents
   launchctl bootstrap "gui/$UID" "$PLIST"
   launchctl enable "gui/$UID/$LABEL"
   launchctl kickstart -k "gui/$UID/$LABEL"
@@ -225,6 +230,7 @@ bootstrap_agent() {
 
 uninstall_agent() {
   launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
+  kill_stray_agents
   rm -f "$PLIST"
 }
 

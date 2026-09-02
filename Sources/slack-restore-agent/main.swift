@@ -88,6 +88,7 @@ struct Config {
     var dryRun: Bool
     var promptPermission: Bool
     var logFile: String?
+    var maxUptime: TimeInterval
 
     static func load(arguments: [String], environment: [String: String]) throws -> Config {
         var config = Config(
@@ -100,7 +101,8 @@ struct Config {
             verbose: environment.bool("SLACK_RESTORE_VERBOSE"),
             dryRun: environment.bool("SLACK_RESTORE_DRY_RUN"),
             promptPermission: false,
-            logFile: environment["SLACK_RESTORE_LOG_FILE"]
+            logFile: environment["SLACK_RESTORE_LOG_FILE"],
+            maxUptime: environment.double("SLACK_RESTORE_MAX_UPTIME_SECONDS") ?? 21600
         )
 
         var index = 0
@@ -130,6 +132,12 @@ struct Config {
                     throw AgentFailure(description: "--interval requires a positive number of seconds")
                 }
                 config.interval = value
+            case "--max-uptime":
+                index += 1
+                guard index < arguments.count, let value = TimeInterval(arguments[index]), value > 0 else {
+                    throw AgentFailure(description: "--max-uptime requires a positive number of seconds")
+                }
+                config.maxUptime = value
             case "--expected-displays":
                 index += 1
                 guard index < arguments.count, let value = Int(arguments[index]), value > 0 else {
@@ -246,6 +254,7 @@ extension Dictionary where Key == String, Value == String {
 struct Display {
     let id: CGDirectDisplayID
     let bounds: CGRect
+    let visibleFrame: CGRect
 }
 
 struct VisibleWindow {
@@ -420,6 +429,18 @@ final class WindowRestoreAgent {
                 )
             }
 
+            // macOS has occasionally reported two displays at overlapping bounds (e.g. an
+            // external display briefly parked at the main display's origin) for extended
+            // stretches after waking or reconfiguring. Moving a window into that bad
+            // geometry sends it to the wrong spot and it looks "stuck" there until the
+            // system corrects itself on its own, so skip enforcement until bounds sort out.
+            if let overlap = firstOverlappingPair(in: displays) {
+                return .idle(
+                    "display-bounds-overlap",
+                    "Display arrangement looks inconsistent (display \(overlap.0.id) and \(overlap.1.id) bounds overlap); waiting for it to settle."
+                )
+            }
+
             let statuses = try config.rules.map { rule in
                 try enforce(rule: rule, displays: displays)
             }
@@ -441,13 +462,16 @@ final class WindowRestoreAgent {
         }
 
         let currentBounds = windowBounds(for: visibleWindow, runningPIDs: runningPIDs)
-        guard !isClose(currentBounds, to: targetDisplay.bounds) else {
+        guard !isClose(currentBounds, to: targetDisplay.visibleFrame) else {
             return .idle("\(rule.key)-already-\(rule.target.rawValue)", "\(rule.displayName) is already on the \(rule.target.description) display.")
         }
 
         switch resolveAXWindow(for: visibleWindow, runningPIDs: runningPIDs) {
         case .found(let window):
-            return move(window: window, to: targetDisplay.bounds, from: visibleWindow, rule: rule)
+            if rule.ignoresWindowTitle(window.title) {
+                return .idle("\(rule.key)-skip-ignored-title", "Ignoring \(rule.displayName) main window because its title is ignored.")
+            }
+            return move(window: window, to: targetDisplay.visibleFrame, from: visibleWindow, rule: rule)
         case .skipped(let reason):
             return .idle("\(rule.key)-skip-\(reason)", "Ignoring \(rule.displayName) main window because it is \(reason).")
         case .missing:
@@ -564,6 +588,17 @@ final class WindowRestoreAgent {
         return nil
     }
 
+    private func firstOverlappingPair(in displays: [Display]) -> (Display, Display)? {
+        for i in displays.indices {
+            for j in displays.indices where j > i {
+                if displays[i].bounds.intersects(displays[j].bounds) {
+                    return (displays[i], displays[j])
+                }
+            }
+        }
+        return nil
+    }
+
     private func activeDisplays() throws -> [Display] {
         var count: UInt32 = 0
         let countResult = CGGetActiveDisplayList(0, nil, &count)
@@ -580,8 +615,31 @@ final class WindowRestoreAgent {
         }
 
         return displayIDs.prefix(Int(count)).map { id in
-            Display(id: id, bounds: CGDisplayBounds(id))
+            let bounds = CGDisplayBounds(id)
+            return Display(id: id, bounds: bounds, visibleFrame: visibleFrame(forDisplay: id, bounds: bounds))
         }
+    }
+
+    // CGDisplayBounds is the raw panel resolution; each display reserves space for its
+    // own menu bar (and the Dock, if docked there). Targeting the raw bounds means the
+    // window server clamps the applied size below what we asked for, `isClose` never
+    // matches, and the agent re-moves the window every poll forever. NSScreen.visibleFrame
+    // gives the actually-usable area, but in AppKit's bottom-left-origin coordinate space,
+    // so it has to be flipped into Quartz's top-left-origin space to compare against AX/CG geometry.
+    private func visibleFrame(forDisplay id: CGDirectDisplayID, bounds: CGRect) -> CGRect {
+        guard let primaryScreenHeight = NSScreen.screens.first?.frame.height else {
+            return bounds
+        }
+        for screen in NSScreen.screens {
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  CGDirectDisplayID(screenNumber.uint32Value) == id else {
+                continue
+            }
+            let visible = screen.visibleFrame
+            let flippedY = primaryScreenHeight - (visible.origin.y + visible.height)
+            return CGRect(x: visible.origin.x, y: flippedY, width: visible.width, height: visible.height)
+        }
+        return bounds
     }
 
     private func runningProcessIDs(for rule: AppRule) -> Set<pid_t> {
@@ -596,7 +654,7 @@ final class WindowRestoreAgent {
             return nil
         }
 
-        return dictionaries.compactMap(VisibleWindow.init(dictionary:))
+        let candidates = dictionaries.compactMap(VisibleWindow.init(dictionary:))
             .filter { window in
                 return rule.matches(window: window, runningPIDs: runningPIDs)
                     && window.layer == 0
@@ -605,9 +663,28 @@ final class WindowRestoreAgent {
                     && window.bounds.height >= config.minWindowHeight
                     && !rule.ignoresWindowTitle(window.title)
             }
-            .max { first, second in
-                first.area < second.area
+            .sorted { $0.area > $1.area }
+
+        // CGWindowName is blank without Screen Recording permission, so the CG-title
+        // check above can miss a Huddle window; cross-check against the Accessibility
+        // title (needs only the Accessibility permission we already require) before
+        // picking the largest remaining candidate.
+        for candidate in candidates {
+            if let axTitle = resolvedAXTitle(for: candidate, runningPIDs: runningPIDs), rule.ignoresWindowTitle(axTitle) {
+                continue
             }
+            return candidate
+        }
+        return candidates.first
+    }
+
+    private func resolvedAXTitle(for visibleWindow: VisibleWindow, runningPIDs: Set<pid_t>) -> String? {
+        switch resolveAXWindow(for: visibleWindow, runningPIDs: runningPIDs) {
+        case .found(let window):
+            return window.title
+        case .skipped, .missing:
+            return nil
+        }
     }
 
     private func resolveAXWindow(for visibleWindow: VisibleWindow, runningPIDs: Set<pid_t>) -> AXResolution {
@@ -764,11 +841,22 @@ private func center(of rect: CGRect) -> CGPoint {
     CGPoint(x: rect.midX, y: rect.midY)
 }
 
-private func isClose(_ first: CGRect, to second: CGRect, tolerance: CGFloat = 8) -> Bool {
-    abs(first.minX - second.minX) <= tolerance
-        && abs(first.minY - second.minY) <= tolerance
-        && abs(first.width - second.width) <= tolerance
-        && abs(first.height - second.height) <= tolerance
+// The window server can clamp an applied size below what we asked for (e.g. a display's
+// own menu bar reserving space we didn't account for), so a window sitting at the correct
+// position but slightly smaller than the target must still count as "in place" - otherwise
+// the agent re-applies the same unreachable target forever, visibly bouncing the window.
+private func isClose(_ first: CGRect, to second: CGRect, tolerance: CGFloat = 8, maxShrink: CGFloat = 100) -> Bool {
+    // A per-display menu bar can push the window's top edge down (and shrink its height to
+    // match) even when we asked for the full display bounds - that shift isn't a positioning
+    // failure, so minY tolerates being pushed down by up to maxShrink, not just +-tolerance.
+    let topInset = first.minY - second.minY
+    guard abs(first.minX - second.minX) <= tolerance, topInset >= -tolerance, topInset <= maxShrink else {
+        return false
+    }
+    let widthDeficit = second.width - first.width
+    let heightDeficit = second.height - first.height
+    return widthDeficit >= -tolerance && widthDeficit <= maxShrink
+        && heightDeficit >= -tolerance && heightDeficit <= maxShrink
 }
 
 private func format(rect: CGRect) -> String {
@@ -788,6 +876,7 @@ private func printHelp() {
     Options:
       --once                         Run one poll and exit.
       --interval SECONDS             Poll interval. Default: 2.
+      --max-uptime SECONDS           Exit (for launchd to relaunch) after running this long. Default: 21600 (6h).
       --expected-displays NUMBER     Required active display count. Default: 3.
       --bundle-id BUNDLE_ID          Override Slack bundle id. Default: com.tinyspeck.slackmacgap.
       --app-name NAME                Override Slack app name. Default: Slack.
@@ -801,6 +890,7 @@ private func printHelp() {
 
     Environment variables:
       SLACK_RESTORE_INTERVAL_SECONDS
+      SLACK_RESTORE_MAX_UPTIME_SECONDS
       SLACK_RESTORE_EXPECTED_DISPLAYS
       SLACK_RESTORE_BUNDLE_ID
       SLACK_RESTORE_APP_NAME
@@ -821,13 +911,27 @@ private func main() throws {
     )
     let agent = WindowRestoreAgent(config: config)
     let reporter = Reporter(verbose: config.verbose, logFile: config.logFile)
+    let startedAt = Date()
 
-    repeat {
+    while true {
         reporter.report(agent.tick())
-        if !config.once {
-            Thread.sleep(forTimeInterval: config.interval)
+        if config.once {
+            break
         }
-    } while !config.once
+
+        // CGGetActiveDisplayList/CGDisplayBounds have been observed to return stale
+        // geometry for a process that has lived through many monitor connect/disconnect
+        // cycles, even though a freshly launched process reads the same live state
+        // correctly. Periodically exiting lets launchd's KeepAlive relaunch us with a
+        // fresh WindowServer connection before that staleness can cause a bad move.
+        let uptime = Date().timeIntervalSince(startedAt)
+        if uptime >= config.maxUptime {
+            reporter.write("[\(ISO8601DateFormatter().string(from: Date()))] Restarting after \(Int(uptime))s uptime to avoid stale display-server state.")
+            break
+        }
+
+        Thread.sleep(forTimeInterval: config.interval)
+    }
 }
 
 do {
