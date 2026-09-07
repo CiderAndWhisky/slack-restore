@@ -89,6 +89,8 @@ struct Config {
     var promptPermission: Bool
     var logFile: String?
     var maxUptime: TimeInterval
+    var settleSeconds: TimeInterval
+    var staleRestartSeconds: TimeInterval
 
     static func load(arguments: [String], environment: [String: String]) throws -> Config {
         var config = Config(
@@ -102,7 +104,9 @@ struct Config {
             dryRun: environment.bool("SLACK_RESTORE_DRY_RUN"),
             promptPermission: false,
             logFile: environment["SLACK_RESTORE_LOG_FILE"],
-            maxUptime: environment.double("SLACK_RESTORE_MAX_UPTIME_SECONDS") ?? 21600
+            maxUptime: environment.double("SLACK_RESTORE_MAX_UPTIME_SECONDS") ?? 21600,
+            settleSeconds: environment.double("SLACK_RESTORE_SETTLE_SECONDS") ?? 5,
+            staleRestartSeconds: environment.double("SLACK_RESTORE_STALE_RESTART_SECONDS") ?? 30
         )
 
         var index = 0
@@ -138,6 +142,18 @@ struct Config {
                     throw AgentFailure(description: "--max-uptime requires a positive number of seconds")
                 }
                 config.maxUptime = value
+            case "--settle":
+                index += 1
+                guard index < arguments.count, let value = TimeInterval(arguments[index]), value >= 0 else {
+                    throw AgentFailure(description: "--settle requires a non-negative number of seconds")
+                }
+                config.settleSeconds = value
+            case "--stale-restart":
+                index += 1
+                guard index < arguments.count, let value = TimeInterval(arguments[index]), value > 0 else {
+                    throw AgentFailure(description: "--stale-restart requires a positive number of seconds")
+                }
+                config.staleRestartSeconds = value
             case "--expected-displays":
                 index += 1
                 guard index < arguments.count, let value = Int(arguments[index]), value > 0 else {
@@ -348,6 +364,7 @@ enum AXResolution {
 struct TickStatus {
     let key: String
     let message: String
+    var restart = false
 
     static func idle(_ key: String, _ message: String) -> TickStatus {
         TickStatus(key: key, message: message)
@@ -407,9 +424,18 @@ final class Reporter {
 
 final class WindowRestoreAgent {
     private let config: Config
+    private var lastArrangementFingerprint: String?
+    private var lastArrangementChangeAt = Date.distantPast
+    private var appKitMismatchSince: Date?
+    var onReconfiguration: ((String) -> Void)?
 
     init(config: Config) {
         self.config = config
+    }
+
+    func noteDisplayReconfiguration(displayID: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        lastArrangementChangeAt = Date()
+        onReconfiguration?("Display \(displayID) reconfiguration: \(describe(flags)).")
     }
 
     func tick() -> TickStatus {
@@ -422,6 +448,7 @@ final class WindowRestoreAgent {
 
         do {
             let displays = try activeDisplays()
+            trackArrangementChanges(in: displays)
             guard displays.count == config.expectedDisplays else {
                 return .idle(
                     "display-count-\(displays.count)",
@@ -439,6 +466,31 @@ final class WindowRestoreAgent {
                     "display-bounds-overlap",
                     "Display arrangement looks inconsistent (display \(overlap.0.id) and \(overlap.1.id) bounds overlap); waiting for it to settle."
                 )
+            }
+
+            // NSScreen is an AppKit-side cache that only refreshes when this process gets
+            // to handle display reconfiguration callbacks. If it disagrees with CoreGraphics,
+            // any visibleFrame we derive from it points at where a display *used* to be
+            // (typically the built-in display alone at the origin, from boot), so refuse to
+            // move anything and, if it never catches up, let launchd hand us a fresh process.
+            if let mismatch = appKitMismatch(for: displays) {
+                let since = appKitMismatchSince ?? Date()
+                appKitMismatchSince = since
+                let elapsed = Date().timeIntervalSince(since)
+                if elapsed >= config.staleRestartSeconds {
+                    return TickStatus(
+                        key: "appkit-stale-restart",
+                        message: "AppKit screen data has not matched CoreGraphics for \(Int(elapsed))s (\(mismatch)); restarting to get a fresh view of the displays.",
+                        restart: true
+                    )
+                }
+                return .idle("appkit-stale", "AppKit screen data does not match CoreGraphics (\(mismatch)); waiting for it to refresh before moving windows.")
+            }
+            appKitMismatchSince = nil
+
+            let sinceChange = Date().timeIntervalSince(lastArrangementChangeAt)
+            if sinceChange < config.settleSeconds {
+                return .idle("arrangement-settling", "Display arrangement changed \(Int(sinceChange))s ago; waiting \(Int(config.settleSeconds))s for it to settle.")
             }
 
             let statuses = try config.rules.map { rule in
@@ -620,6 +672,38 @@ final class WindowRestoreAgent {
         }
     }
 
+    private func trackArrangementChanges(in displays: [Display]) {
+        let fingerprint = displays
+            .map { "\($0.id)@\(format(rect: $0.bounds))" }
+            .sorted()
+            .joined(separator: ";")
+        if let previous = lastArrangementFingerprint, previous != fingerprint {
+            lastArrangementChangeAt = Date()
+            onReconfiguration?("Display arrangement changed: \(fingerprint).")
+        }
+        lastArrangementFingerprint = fingerprint
+    }
+
+    private func appKitMismatch(for displays: [Display]) -> String? {
+        let screens = NSScreen.screens
+        guard let primaryScreenHeight = screens.first?.frame.height else {
+            return "AppKit reports no screens"
+        }
+        if screens.count != displays.count {
+            return "AppKit sees \(screens.count) screens but CoreGraphics sees \(displays.count)"
+        }
+        for display in displays {
+            guard let screen = screens.first(where: { displayID(of: $0) == display.id }) else {
+                return "display \(display.id) is missing from AppKit's screen list"
+            }
+            let appKitBounds = flipToQuartz(screen.frame, primaryScreenHeight: primaryScreenHeight)
+            if !isSameRect(appKitBounds, display.bounds) {
+                return "display \(display.id) is at \(format(rect: display.bounds)) in CoreGraphics but \(format(rect: appKitBounds)) in AppKit"
+            }
+        }
+        return nil
+    }
+
     // CGDisplayBounds is the raw panel resolution; each display reserves space for its
     // own menu bar (and the Dock, if docked there). Targeting the raw bounds means the
     // window server clamps the applied size below what we asked for, `isClose` never
@@ -627,19 +711,28 @@ final class WindowRestoreAgent {
     // gives the actually-usable area, but in AppKit's bottom-left-origin coordinate space,
     // so it has to be flipped into Quartz's top-left-origin space to compare against AX/CG geometry.
     private func visibleFrame(forDisplay id: CGDirectDisplayID, bounds: CGRect) -> CGRect {
-        guard let primaryScreenHeight = NSScreen.screens.first?.frame.height else {
+        let screens = NSScreen.screens
+        guard let primaryScreenHeight = screens.first?.frame.height,
+              let screen = screens.first(where: { displayID(of: $0) == id }) else {
             return bounds
         }
-        for screen in NSScreen.screens {
-            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-                  CGDirectDisplayID(screenNumber.uint32Value) == id else {
-                continue
-            }
-            let visible = screen.visibleFrame
-            let flippedY = primaryScreenHeight - (visible.origin.y + visible.height)
-            return CGRect(x: visible.origin.x, y: flippedY, width: visible.width, height: visible.height)
+        return flipToQuartz(screen.visibleFrame, primaryScreenHeight: primaryScreenHeight)
+    }
+
+    private func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
         }
-        return bounds
+        return CGDirectDisplayID(number.uint32Value)
+    }
+
+    private func flipToQuartz(_ rect: CGRect, primaryScreenHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: rect.origin.x,
+            y: primaryScreenHeight - (rect.origin.y + rect.height),
+            width: rect.width,
+            height: rect.height
+        )
     }
 
     private func runningProcessIDs(for rule: AppRule) -> Set<pid_t> {
@@ -859,6 +952,43 @@ private func isClose(_ first: CGRect, to second: CGRect, tolerance: CGFloat = 8,
         && heightDeficit >= -tolerance && heightDeficit <= maxShrink
 }
 
+private func isSameRect(_ first: CGRect, _ second: CGRect, tolerance: CGFloat = 1) -> Bool {
+    abs(first.minX - second.minX) <= tolerance
+        && abs(first.minY - second.minY) <= tolerance
+        && abs(first.width - second.width) <= tolerance
+        && abs(first.height - second.height) <= tolerance
+}
+
+private func describe(_ flags: CGDisplayChangeSummaryFlags) -> String {
+    let names: [(CGDisplayChangeSummaryFlags, String)] = [
+        (.beginConfigurationFlag, "begin"),
+        (.movedFlag, "moved"),
+        (.setMainFlag, "set-main"),
+        (.setModeFlag, "set-mode"),
+        (.addFlag, "added"),
+        (.removeFlag, "removed"),
+        (.enabledFlag, "enabled"),
+        (.disabledFlag, "disabled"),
+        (.mirrorFlag, "mirrored"),
+        (.unMirrorFlag, "unmirrored"),
+        (.desktopShapeChangedFlag, "desktop-shape-changed")
+    ]
+    let matched = names.filter { flags.contains($0.0) }.map(\.1)
+    return matched.isEmpty ? "flags=\(flags.rawValue)" : matched.joined(separator: ",")
+}
+
+private func registerDisplayReconfigurationCallback(for agent: WindowRestoreAgent) -> Bool {
+    let context = Unmanaged.passUnretained(agent).toOpaque()
+    let result = CGDisplayRegisterReconfigurationCallback({ displayID, flags, userInfo in
+        guard let userInfo else {
+            return
+        }
+        Unmanaged<WindowRestoreAgent>.fromOpaque(userInfo).takeUnretainedValue()
+            .noteDisplayReconfiguration(displayID: displayID, flags: flags)
+    }, context)
+    return result == .success
+}
+
 private func format(rect: CGRect) -> String {
     "x=\(Int(rect.minX)) y=\(Int(rect.minY)) w=\(Int(rect.width)) h=\(Int(rect.height))"
 }
@@ -877,6 +1007,8 @@ private func printHelp() {
       --once                         Run one poll and exit.
       --interval SECONDS             Poll interval. Default: 2.
       --max-uptime SECONDS           Exit (for launchd to relaunch) after running this long. Default: 21600 (6h).
+      --settle SECONDS               Wait this long after a display change before moving windows. Default: 5.
+      --stale-restart SECONDS        Exit (for launchd to relaunch) if AppKit and CoreGraphics disagree about display geometry for this long. Default: 30.
       --expected-displays NUMBER     Required active display count. Default: 3.
       --bundle-id BUNDLE_ID          Override Slack bundle id. Default: com.tinyspeck.slackmacgap.
       --app-name NAME                Override Slack app name. Default: Slack.
@@ -891,6 +1023,8 @@ private func printHelp() {
     Environment variables:
       SLACK_RESTORE_INTERVAL_SECONDS
       SLACK_RESTORE_MAX_UPTIME_SECONDS
+      SLACK_RESTORE_SETTLE_SECONDS
+      SLACK_RESTORE_STALE_RESTART_SECONDS
       SLACK_RESTORE_EXPECTED_DISPLAYS
       SLACK_RESTORE_BUNDLE_ID
       SLACK_RESTORE_APP_NAME
@@ -911,12 +1045,27 @@ private func main() throws {
     )
     let agent = WindowRestoreAgent(config: config)
     let reporter = Reporter(verbose: config.verbose, logFile: config.logFile)
-    let startedAt = Date()
 
-    while true {
+    if config.once {
         reporter.report(agent.tick())
-        if config.once {
-            break
+        return
+    }
+
+    let startedAt = Date()
+    agent.onReconfiguration = { message in
+        if config.verbose {
+            reporter.write("[\(ISO8601DateFormatter().string(from: Date()))] \(message)")
+        }
+    }
+    if !registerDisplayReconfigurationCallback(for: agent) {
+        reporter.write("[\(ISO8601DateFormatter().string(from: Date()))] Could not register for display reconfiguration callbacks; relying on polling only.")
+    }
+
+    func poll() {
+        let status = agent.tick()
+        reporter.report(status)
+        if status.restart {
+            exit(0)
         }
 
         // CGGetActiveDisplayList/CGDisplayBounds have been observed to return stale
@@ -927,11 +1076,17 @@ private func main() throws {
         let uptime = Date().timeIntervalSince(startedAt)
         if uptime >= config.maxUptime {
             reporter.write("[\(ISO8601DateFormatter().string(from: Date()))] Restarting after \(Int(uptime))s uptime to avoid stale display-server state.")
-            break
+            exit(0)
         }
-
-        Thread.sleep(forTimeInterval: config.interval)
     }
+
+    // Polling from a timer on the main run loop (instead of Thread.sleep) is what lets
+    // AppKit and CoreGraphics deliver display reconfiguration callbacks to this process;
+    // without a running run loop NSScreen.screens is frozen at whatever it saw first.
+    poll()
+    let timer = Timer(timeInterval: config.interval, repeats: true) { _ in poll() }
+    RunLoop.main.add(timer, forMode: .common)
+    RunLoop.main.run()
 }
 
 do {

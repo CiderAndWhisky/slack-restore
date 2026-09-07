@@ -45,6 +45,33 @@ Environment:
 EOF
 }
 
+# TCC ties the Accessibility grant to the bundle's designated code requirement. An ad-hoc
+# signature's requirement is its cdhash, which changes on every build, so every rebuild
+# used to silently drop the permission. A named identity (self-signed is enough, see
+# README) gives a stable requirement that survives rebuilds.
+sign_identity() {
+  if [[ -n "${SLACK_RESTORE_SIGN_IDENTITY:-}" ]]; then
+    echo "$SLACK_RESTORE_SIGN_IDENTITY"
+  elif security find-identity -v -p codesigning 2>/dev/null | grep -q '"Slack Restore Agent"'; then
+    echo "Slack Restore Agent"
+  else
+    echo "-"
+  fi
+}
+
+sign_bundle() {
+  local identity
+  identity="$(sign_identity)"
+  if [[ "$identity" != "-" ]]; then
+    if codesign --force --sign "$identity" "$APP_BUNDLE" 2>/tmp/slack-restore-codesign.err; then
+      return 0
+    fi
+    echo "warning: signing with '$identity' failed, falling back to ad-hoc (Accessibility grant will not survive rebuilds):" >&2
+    cat /tmp/slack-restore-codesign.err >&2
+  fi
+  codesign --force --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
+}
+
 build_helper() {
   mkdir -p "$APP_MACOS"
   local needs_sign=0
@@ -89,7 +116,7 @@ EOF
   fi
   if command -v codesign >/dev/null 2>&1; then
     if [[ "$needs_sign" == "1" ]] || ! codesign --verify "$APP_BUNDLE" >/dev/null 2>&1; then
-      codesign --force --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
+      sign_bundle
     fi
   fi
 }
@@ -157,8 +184,6 @@ write_plist() {
     <string>$interval</string>
     <string>--expected-displays</string>
     <string>$expected_displays</string>
-    <string>--log-file</string>
-    <string>$OUT_LOG</string>
 $verbose_plist
   </array>
   <key>EnvironmentVariables</key>
@@ -220,9 +245,19 @@ kill_stray_agents() {
   pkill -f "$APP_MACOS/slack-restore-agent" >/dev/null 2>&1 || true
 }
 
+rotate_logs() {
+  local log
+  for log in "$OUT_LOG" "$ERR_LOG"; do
+    if [[ -f "$log" ]] && (( $(stat -f%z "$log") > 5000000 )); then
+      mv -f "$log" "$log.1"
+    fi
+  done
+}
+
 bootstrap_agent() {
   launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
   kill_stray_agents
+  rotate_logs
   launchctl bootstrap "gui/$UID" "$PLIST"
   launchctl enable "gui/$UID/$LABEL"
   launchctl kickstart -k "gui/$UID/$LABEL"
@@ -241,6 +276,7 @@ case "$command" in
   build)
     build_helper
     echo "$APP_BUNDLE"
+    echo "Signed with: $(codesign -dvv "$APP_BUNDLE" 2>&1 | awk -F= '/^(Authority|Signature)=/{print $2; exit}')"
     ;;
   run)
     run_app_with_logs "$@"
