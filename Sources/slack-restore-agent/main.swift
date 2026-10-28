@@ -49,10 +49,6 @@ struct AppRule {
     let target: DisplayTarget
     let ignoredWindowTitles: Set<String>
     let ignoredWindowTitleFragments: Set<String>
-    /// When non-empty, a window with a non-empty title is only treated as the main
-    /// window if its title ends with one of these (lowercased) suffixes. Slack's main
-    /// window always ends in " - Slack"; Huddle/call pop-outs do not.
-    let requiredWindowTitleSuffixes: Set<String>
 
     var key: String {
         displayName
@@ -79,16 +75,8 @@ struct AppRule {
 
     func ignoresWindowTitle(_ title: String) -> Bool {
         let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if ignoredWindowTitles.contains(normalizedTitle)
-            || ignoredWindowTitleFragments.contains(where: { normalizedTitle.contains($0) }) {
-            return true
-        }
-        // An empty title cannot be judged (CGWindowName is blank without Screen
-        // Recording permission); callers cross-check the Accessibility title instead.
-        if !requiredWindowTitleSuffixes.isEmpty, !normalizedTitle.isEmpty {
-            return !requiredWindowTitleSuffixes.contains(where: { normalizedTitle.hasSuffix($0) })
-        }
-        return false
+        return ignoredWindowTitles.contains(normalizedTitle)
+            || ignoredWindowTitleFragments.contains(where: { normalizedTitle.contains($0) })
     }
 }
 
@@ -221,8 +209,7 @@ struct Config {
                 appNames: Set([slackName, "Slack"]),
                 target: .leftmost,
                 ignoredWindowTitles: Set(["preferences", "settings", "about slack"]),
-                ignoredWindowTitleFragments: Set(["huddle", "junta", "reunión", "reunion", "slack call", "call with", "llamada"]),
-                requiredWindowTitleSuffixes: Set(["- slack"])
+                ignoredWindowTitleFragments: Set(["huddle", "junta", "reunión", "reunion", "slack call", "call with", "llamada"])
             ),
             AppRule(
                 displayName: outlookName,
@@ -230,8 +217,7 @@ struct Config {
                 appNames: Set([outlookName, "Outlook", "Microsoft Outlook"]),
                 target: .rightmost,
                 ignoredWindowTitles: Set(["preferences", "settings", "about microsoft outlook", "about outlook"]),
-                ignoredWindowTitleFragments: Set(),
-                requiredWindowTitleSuffixes: Set()
+                ignoredWindowTitleFragments: Set()
             )
         ]
     }
@@ -245,8 +231,7 @@ extension AppRule {
             appNames: appNames,
             target: target,
             ignoredWindowTitles: ignoredWindowTitles,
-            ignoredWindowTitleFragments: ignoredWindowTitleFragments,
-            requiredWindowTitleSuffixes: requiredWindowTitleSuffixes
+            ignoredWindowTitleFragments: ignoredWindowTitleFragments
         )
     }
 
@@ -257,8 +242,7 @@ extension AppRule {
             appNames: appNames,
             target: target,
             ignoredWindowTitles: ignoredWindowTitles,
-            ignoredWindowTitleFragments: ignoredWindowTitleFragments,
-            requiredWindowTitleSuffixes: requiredWindowTitleSuffixes
+            ignoredWindowTitleFragments: ignoredWindowTitleFragments
         )
     }
 }
