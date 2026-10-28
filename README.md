@@ -54,9 +54,11 @@ cd "$(mktemp -d)"
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout key.pem -out cert.pem -subj "/CN=Slack Restore Agent" \
   -addext "keyUsage=digitalSignature" -addext "extendedKeyUsage=codeSigning"
-openssl pkcs12 -export -out identity.p12 -inkey key.pem -in cert.pem -passout pass:slack-restore
+# `-legacy` is required with OpenSSL 3: `security import` cannot read the default
+# PKCS12 encryption and fails with "MAC verification failed".
+openssl pkcs12 -export -legacy -out identity.p12 -inkey key.pem -in cert.pem -passout pass:slack-restore
 security import identity.p12 -k ~/Library/Keychains/login.keychain-db -P slack-restore -T /usr/bin/codesign
-security add-trusted-cert -r trustRoot -p codeSign -k ~/Library/Keychains/login.keychain-db cert.pem
+security add-trusted-cert -r trustRoot -p codeSign -k ~/Library/Keychains/login.keychain-db cert.pem   # asks for your login password
 security find-identity -v -p codesigning   # should list "Slack Restore Agent"
 ```
 
