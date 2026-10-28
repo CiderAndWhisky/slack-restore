@@ -49,6 +49,10 @@ struct AppRule {
     let target: DisplayTarget
     let ignoredWindowTitles: Set<String>
     let ignoredWindowTitleFragments: Set<String>
+    /// When non-empty, a window with a non-empty title is only treated as the main
+    /// window if its title ends with one of these (lowercased) suffixes. Slack's main
+    /// window always ends in " - Slack"; Huddle/call pop-outs do not.
+    let requiredWindowTitleSuffixes: Set<String>
 
     var key: String {
         displayName
@@ -70,10 +74,21 @@ struct AppRule {
         runningPIDs.contains(window.ownerPID) || appNames.contains(window.ownerName)
     }
 
+    /// Lowercased fragment that marks the app's primary window in its Accessibility title.
+    var mainWindowTitleMarker: String { "[main]" }
+
     func ignoresWindowTitle(_ title: String) -> Bool {
         let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ignoredWindowTitles.contains(normalizedTitle)
-            || ignoredWindowTitleFragments.contains(where: { normalizedTitle.contains($0) })
+        if ignoredWindowTitles.contains(normalizedTitle)
+            || ignoredWindowTitleFragments.contains(where: { normalizedTitle.contains($0) }) {
+            return true
+        }
+        // An empty title cannot be judged (CGWindowName is blank without Screen
+        // Recording permission); callers cross-check the Accessibility title instead.
+        if !requiredWindowTitleSuffixes.isEmpty, !normalizedTitle.isEmpty {
+            return !requiredWindowTitleSuffixes.contains(where: { normalizedTitle.hasSuffix($0) })
+        }
+        return false
     }
 }
 
@@ -206,7 +221,8 @@ struct Config {
                 appNames: Set([slackName, "Slack"]),
                 target: .leftmost,
                 ignoredWindowTitles: Set(["preferences", "settings", "about slack"]),
-                ignoredWindowTitleFragments: Set(["huddle", "junta", "slack call", "call with", "llamada"])
+                ignoredWindowTitleFragments: Set(["huddle", "junta", "reunión", "reunion", "slack call", "call with", "llamada"]),
+                requiredWindowTitleSuffixes: Set(["- slack"])
             ),
             AppRule(
                 displayName: outlookName,
@@ -214,7 +230,8 @@ struct Config {
                 appNames: Set([outlookName, "Outlook", "Microsoft Outlook"]),
                 target: .rightmost,
                 ignoredWindowTitles: Set(["preferences", "settings", "about microsoft outlook", "about outlook"]),
-                ignoredWindowTitleFragments: Set()
+                ignoredWindowTitleFragments: Set(),
+                requiredWindowTitleSuffixes: Set()
             )
         ]
     }
@@ -228,7 +245,8 @@ extension AppRule {
             appNames: appNames,
             target: target,
             ignoredWindowTitles: ignoredWindowTitles,
-            ignoredWindowTitleFragments: ignoredWindowTitleFragments
+            ignoredWindowTitleFragments: ignoredWindowTitleFragments,
+            requiredWindowTitleSuffixes: requiredWindowTitleSuffixes
         )
     }
 
@@ -239,7 +257,8 @@ extension AppRule {
             appNames: appNames,
             target: target,
             ignoredWindowTitles: ignoredWindowTitles,
-            ignoredWindowTitleFragments: ignoredWindowTitleFragments
+            ignoredWindowTitleFragments: ignoredWindowTitleFragments,
+            requiredWindowTitleSuffixes: requiredWindowTitleSuffixes
         )
     }
 }
@@ -521,7 +540,7 @@ final class WindowRestoreAgent {
         switch resolveAXWindow(for: visibleWindow, runningPIDs: runningPIDs) {
         case .found(let window):
             if rule.ignoresWindowTitle(window.title) {
-                return .idle("\(rule.key)-skip-ignored-title", "Ignoring \(rule.displayName) main window because its title is ignored.")
+                return .idle("\(rule.key)-skip-ignored-title", "Ignoring \(rule.displayName) window \(visibleWindow.windowNumber) \"\(window.title)\" because it is not the main window.")
             }
             return move(window: window, to: targetDisplay.visibleFrame, from: visibleWindow, rule: rule)
         case .skipped(let reason):
@@ -573,7 +592,7 @@ final class WindowRestoreAgent {
 
         return .important(
             "\(rule.key)-moved-\(visibleWindow.windowNumber)-\(Int(targetBounds.minX))-\(Int(targetBounds.minY))",
-            "Moved \(rule.displayName) window \(visibleWindow.windowNumber) to the \(rule.target.description) display \(format(rect: targetBounds))."
+            "Moved \(rule.displayName) window \(visibleWindow.windowNumber) \"\(window.title)\" to the \(rule.target.description) display \(format(rect: targetBounds))."
         )
     }
 
@@ -756,19 +775,28 @@ final class WindowRestoreAgent {
                     && window.bounds.height >= config.minWindowHeight
                     && !rule.ignoresWindowTitle(window.title)
             }
-            .sorted { $0.area > $1.area }
 
         // CGWindowName is blank without Screen Recording permission, so the CG-title
         // check above can miss a Huddle window; cross-check against the Accessibility
-        // title (needs only the Accessibility permission we already require) before
-        // picking the largest remaining candidate.
-        for candidate in candidates {
-            if let axTitle = resolvedAXTitle(for: candidate, runningPIDs: runningPIDs), rule.ignoresWindowTitle(axTitle) {
-                continue
+        // title (needs only the Accessibility permission we already require).
+        let titled: [(window: VisibleWindow, title: String)] = candidates.compactMap { candidate in
+            let title = resolvedAXTitle(for: candidate, runningPIDs: runningPIDs) ?? candidate.title
+            if rule.ignoresWindowTitle(title) {
+                return nil
             }
-            return candidate
+            return (candidate, title)
         }
-        return candidates.first
+
+        // Slack tags the Accessibility title of its primary window with "[Main]"; a
+        // Huddle pop-out is titled like a normal conversation window and can be larger
+        // than the primary window, so size is not a usable signal.
+        if let marked = titled.first(where: { $0.title.lowercased().contains(rule.mainWindowTitleMarker) }) {
+            return marked.window
+        }
+
+        // Otherwise prefer the oldest window: the primary window is created at launch
+        // and gets the lowest window number; Huddles, pop-outs and dialogs come later.
+        return titled.min { $0.window.windowNumber < $1.window.windowNumber }?.window
     }
 
     private func resolvedAXTitle(for visibleWindow: VisibleWindow, runningPIDs: Set<pid_t>) -> String? {
