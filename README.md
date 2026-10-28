@@ -62,6 +62,14 @@ security add-trusted-cert -r trustRoot -p codeSign -k ~/Library/Keychains/login.
 security find-identity -v -p codesigning   # should list "Slack Restore Agent"
 ```
 
+If `bin/slack-restore build` asks for your login password on every build, the keychain is
+guarding the private key. Either click **Always Allow** in that dialog once, or run this
+(it prompts for your login password) so `codesign` can use the key silently:
+
+```sh
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db
+```
+
 Then rebuild, re-grant Accessibility one last time, and future rebuilds keep the grant:
 
 ```sh
